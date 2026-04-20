@@ -313,6 +313,7 @@ static const char* packetTypeName(PacketType type) {
         case CMD_LED_PULSE_BLUE: return "CMD_LED_PULSE_BLUE";
         case CMD_LED_STEADY_RED: return "CMD_LED_STEADY_RED";
         case CMD_LED_HEALTHY: return "CMD_LED_HEALTHY";
+        case CMD_FLED_PULSE: return "CMD_FLED_PULSE";
         default: return "UNKNOWN";
     }
 }
@@ -1933,11 +1934,25 @@ void handlePacket(PacketType type, uint8_t *buffer, uint8_t len) {
 
             case CMD_FLED_PULSE: {
                 // Payload: optional 4-byte big-endian uint32 duration in ms. Default 5000 ms.
+                // Special case: 0 ms means immediate OFF and timer cancel.
                 unsigned long onMs = 5000;
                 if (len >= 4) {
                     onMs = ((uint32_t)buffer[0] << 24) | ((uint32_t)buffer[1] << 16)
                          | ((uint32_t)buffer[2] << 8)  |  (uint32_t)buffer[3];
                 }
+
+                if (onMs == 0) {
+                    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        mcp.pinMode(1, OUTPUT);
+                        mcp.digitalWrite(1, LOW);
+                        xSemaphoreGive(i2cMutex);
+                    }
+                    fledOffAtMs = 0;
+                    Serial.println("[FLED] Floodlight OFF (immediate command).");
+                    logHealthEvent("FLED", "off immediate");
+                    break;
+                }
+
                 if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     mcp.pinMode(1, OUTPUT);
                     mcp.digitalWrite(1, HIGH);
