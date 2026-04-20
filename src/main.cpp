@@ -216,6 +216,7 @@ static void applyCORSHeaders();
 static void audioCaptureTask(void* parameter);
 static void queueScopeFrame(const int16_t* samples, size_t byteCount);
 static void broadcastPendingScopeFrame();
+static void checkWifiWatchdog();
 
 void sendPacket(HardwareSerial &port, PacketType type, const uint8_t *payload, uint8_t length) {
     uint8_t checksum = type ^ length;
@@ -813,6 +814,8 @@ bool connectWifiAndStartServices(const char* ssid, const char* password, const c
     }
 
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);       // Keep radio always-on so inbound TCP connects are never missed
+    WiFi.setAutoReconnect(true);
     WiFi.begin(ssid, password);
 
     Serial.printf("Connecting to WiFi via %s...\n", sourceTag);
@@ -2057,6 +2060,50 @@ void handlePacket(PacketType type, uint8_t *buffer, uint8_t len) {
     }
 }
 
+// WiFi connectivity watchdog.
+// After IDLE_THRESHOLD_MS of no inbound HTTP or WebSocket activity, forces a reconnect
+// and restarts the HTTP + WebSocket servers. This recovers from the ESP32 modem-sleep
+// condition where WiFi.status() shows WL_CONNECTED but new inbound TCP connections are
+// silently dropped by the radio after extended idle periods.
+// WiFi.setSleep(false) is the primary prevention; this function is the self-heal backstop.
+static void checkWifiWatchdog() {
+    if (!wifiConfigured || isRecording) return;
+
+    static constexpr unsigned long IDLE_THRESHOLD_MS    = 20UL * 60UL * 1000UL; // 20 min
+    static constexpr unsigned long RECONNECT_TIMEOUT_MS = 20000;
+    static bool          reconnectPending = false;
+    static unsigned long reconnectStartMs = 0;
+
+    if (reconnectPending) {
+        if (WiFi.status() == WL_CONNECTED) {
+            server.begin();
+            webSocket.begin();
+            webSocket.onEvent(webSocketEvent);
+            reconnectPending = false;
+            logHealthEvent("WIFI", "watchdog reconnect OK; services restarted");
+        } else if (millis() - reconnectStartMs > RECONNECT_TIMEOUT_MS) {
+            reconnectPending = false;
+            logHealthEvent("WIFI", "watchdog reconnect timed out; will retry next cycle");
+        }
+        return;
+    }
+
+    unsigned long now = millis();
+    unsigned long lastActivity = max(lastWebRequestMs, lastWebSocketEventMs);
+    unsigned long idleMs = (lastActivity == 0) ? now : (now - lastActivity);
+
+    if (idleMs >= IDLE_THRESHOLD_MS) {
+        logHealthEvent("WIFI", String("watchdog: ") + String(idleMs / 60000) + "min idle; reconnecting");
+        server.stop();
+        WiFi.reconnect();
+        reconnectPending  = true;
+        reconnectStartMs  = now;
+        // Advance timestamps to prevent immediate re-trigger after reconnect completes
+        lastWebRequestMs     = now;
+        lastWebSocketEventMs = now;
+    }
+}
+
 void loop() {
         // --- Serial commands for local testing (rec, led, and UART LED packet simulation) ---
         static String serialCmd = "";
@@ -2119,6 +2166,7 @@ void loop() {
         broadcastPendingScopeFrame();
         ElegantOTA.loop();
         server.handleClient();
+        checkWifiWatchdog();
     }
      
     if (isRecording && recordingStopDeadlineMs > 0 && millis() >= recordingStopDeadlineMs) {
