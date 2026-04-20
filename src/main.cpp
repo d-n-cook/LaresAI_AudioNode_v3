@@ -195,6 +195,10 @@ static PacketType healthLastUartType = ERROR_PKT;
 static bool healthLogStorageReady = false;
 static String healthLogFilePath = HEALTH_LOG_FALLBACK_FILE;
 static uint8_t fileStreamBuffer[FILE_STREAM_CHUNK_SIZE];
+static portMUX_TYPE scopeFrameMux = portMUX_INITIALIZER_UNLOCKED;
+static int16_t pendingScopeFrame[FRAME_SAMPLES] = {0};
+static size_t pendingScopeFrameBytes = 0;
+static volatile bool scopeFramePending = false;
 static volatile unsigned long lastAudioFrameMs = 0;
 static volatile uint32_t audioTaskLoopCount = 0;
 static volatile uint32_t audioI2sErrCount = 0;
@@ -210,6 +214,8 @@ static String getHealthLogPathForDaysPast(int logDaysPast);
 static bool streamTextFileResponse(const String& path);
 static void applyCORSHeaders();
 static void audioCaptureTask(void* parameter);
+static void queueScopeFrame(const int16_t* samples, size_t byteCount);
+static void broadcastPendingScopeFrame();
 
 void sendPacket(HardwareSerial &port, PacketType type, const uint8_t *payload, uint8_t length) {
     uint8_t checksum = type ^ length;
@@ -395,15 +401,61 @@ static bool streamTextFileResponse(const String& path) {
     server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
     server.sendHeader("Content-Type", "text/plain");
     server.setContentLength(f.size());
-    server.send(200);
+    server.send(200, "text/plain", "");
 
-    while (f.available()) {
+    WiFiClient client = server.client();
+    if (!client || !client.connected()) {
+        f.close();
+        return true;
+    }
+
+    while (f.available() && client.connected()) {
         size_t bytesRead = f.read(fileStreamBuffer, FILE_STREAM_CHUNK_SIZE);
-        server.sendContent((const char*)fileStreamBuffer, bytesRead);
+        if (bytesRead == 0) {
+            break;
+        }
+
+        size_t written = client.write(fileStreamBuffer, bytesRead);
+        if (written != bytesRead) {
+            break;
+        }
     }
 
     f.close();
     return true;
+}
+
+static void queueScopeFrame(const int16_t* samples, size_t byteCount) {
+    size_t clampedBytes = (byteCount > sizeof(pendingScopeFrame)) ? sizeof(pendingScopeFrame) : byteCount;
+    taskENTER_CRITICAL(&scopeFrameMux);
+    memcpy(pendingScopeFrame, samples, clampedBytes);
+    pendingScopeFrameBytes = clampedBytes;
+    scopeFramePending = (clampedBytes > 0);
+    taskEXIT_CRITICAL(&scopeFrameMux);
+}
+
+static void broadcastPendingScopeFrame() {
+    if (!scopeFramePending) {
+        return;
+    }
+
+    int16_t localFrame[FRAME_SAMPLES] = {0};
+    size_t localBytes = 0;
+
+    taskENTER_CRITICAL(&scopeFrameMux);
+    if (scopeFramePending) {
+        localBytes = pendingScopeFrameBytes;
+        memcpy(localFrame, pendingScopeFrame, localBytes);
+        scopeFramePending = false;
+        pendingScopeFrameBytes = 0;
+    }
+    taskEXIT_CRITICAL(&scopeFrameMux);
+
+    if (localBytes == 0 || webSocket.connectedClients() == 0) {
+        return;
+    }
+
+    webSocket.broadcastBIN((uint8_t*)localFrame, localBytes);
 }
 
 static void logHealthEvent(const char* topic, const String& message) {
@@ -633,8 +685,12 @@ void setupWebServer() {
         server.send(200, "audio/wav", "");
 
         WiFiClient client = server.client();
+        if (!client || !client.connected()) {
+            audioFile.close();
+            return;
+        }
 
-        while (audioFile.available()) {
+        while (audioFile.available() && client.connected()) {
             size_t bytesRead = audioFile.read(fileStreamBuffer, FILE_STREAM_CHUNK_SIZE);
             if (bytesRead == 0) {
                 break;
@@ -1723,13 +1779,13 @@ static void audioCaptureTask(void* parameter) {
         }
 
         // Keep oscilloscope streaming active during idle operation, but mute while recording.
-        if (!isRecording && webSocket.connectedClients() > 0) {
+        if (!isRecording) {
             int16_t scopeFrame[FRAME_SAMPLES] = {0};
             for (size_t i = 0; i < validSamples; i++) {
                 int32_t scaled = (int32_t)frame[i] * 8;
                 scopeFrame[i] = (int16_t)constrain(scaled, -32768, 32767);
             }
-            webSocket.broadcastBIN((uint8_t*)scopeFrame, sizeof(scopeFrame));
+            queueScopeFrame(scopeFrame, sizeof(scopeFrame));
         }
 
         int32_t center = (minVal + maxVal) / 2;
@@ -2060,6 +2116,7 @@ void loop() {
 
     if (!isRecording) {
         webSocket.loop();
+        broadcastPendingScopeFrame();
         ElegantOTA.loop();
         server.handleClient();
     }
