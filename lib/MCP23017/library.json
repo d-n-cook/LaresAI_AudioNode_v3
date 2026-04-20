@@ -1,0 +1,17 @@
+{
+  "name": "MCP23017",
+  "version": "1.0.0",
+  "description": "MCP23017 I2C IO Expander library migrated from LaresAI_Device_v3",
+  "keywords": "MCP23017, IO Expander, I2C",
+  "repository": {
+    "type": "local",
+    "url": ""
+  },
+  "authors": [
+    {
+      "name": "LaresAI Team"
+    }
+  ],
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

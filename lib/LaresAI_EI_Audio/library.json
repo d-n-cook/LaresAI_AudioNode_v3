@@ -1,0 +1,11 @@
+{
+  "name": "LaresAI_EI_Audio",
+  "version": "1.0.0",
+  "dependencies": [
+    {
+      "name": "ESP32 Arduino",
+      "frameworks": ["arduino"],
+      "platforms": ["espressif32"]
+    }
+  ]
+}
