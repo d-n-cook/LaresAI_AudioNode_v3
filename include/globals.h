@@ -8,7 +8,7 @@ extern MCP23017 mcp;
 
 // LED status control via MCP23017 — set to 1 when LED hardware is ready
 #ifndef ENABLE_MCP_STATUS_LED
-#define ENABLE_MCP_STATUS_LED 1
+#define ENABLE_MCP_STATUS_LED 1FVVVVVV
 #endif
 
 #ifndef STATUS_LED_ACTIVE_LOW

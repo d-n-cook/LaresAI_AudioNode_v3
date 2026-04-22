@@ -2061,46 +2061,55 @@ void handlePacket(PacketType type, uint8_t *buffer, uint8_t len) {
 }
 
 // WiFi connectivity watchdog.
-// After IDLE_THRESHOLD_MS of no inbound HTTP or WebSocket activity, forces a reconnect
-// and restarts the HTTP + WebSocket servers. This recovers from the ESP32 modem-sleep
-// condition where WiFi.status() shows WL_CONNECTED but new inbound TCP connections are
-// silently dropped by the radio after extended idle periods.
-// WiFi.setSleep(false) is the primary prevention; this function is the self-heal backstop.
+//
+// PRIMARY fix: reconnect detection.
+// When WiFi drops and auto-reconnects, the lwIP stack silently tears down all TCP
+// server sockets. server.handleClient() and webSocket.loop() continue to run but
+// accept nothing. Tracking the previous WiFi connection state lets us detect the
+// transition and immediately restart the listening sockets.
+//
+// BACKSTOP: if no inbound TCP activity is seen for 20 min while WiFi appears up,
+// force a reconnect cycle to clear any degraded radio/stack state. This covers
+// edge cases that don't produce a visible disconnect event.
 static void checkWifiWatchdog() {
-    if (!wifiConfigured || isRecording) return;
+    if (!wifiConfigured) return;
 
-    static constexpr unsigned long IDLE_THRESHOLD_MS    = 20UL * 60UL * 1000UL; // 20 min
-    static constexpr unsigned long RECONNECT_TIMEOUT_MS = 20000;
-    static bool          reconnectPending = false;
-    static unsigned long reconnectStartMs = 0;
+    // --- Reconnect detection ---
+    static bool prevWifiUp = false;
+    bool wifiUp = (WiFi.status() == WL_CONNECTED);
 
-    if (reconnectPending) {
-        if (WiFi.status() == WL_CONNECTED) {
-            server.begin();
-            webSocket.begin();
-            webSocket.onEvent(webSocketEvent);
-            reconnectPending = false;
-            logHealthEvent("WIFI", "watchdog reconnect OK; services restarted");
-        } else if (millis() - reconnectStartMs > RECONNECT_TIMEOUT_MS) {
-            reconnectPending = false;
-            logHealthEvent("WIFI", "watchdog reconnect timed out; will retry next cycle");
-        }
-        return;
+    if (!prevWifiUp && wifiUp && webServerStarted) {
+        // WiFi just came back up. Restart TCP services so the server sockets are
+        // re-bound to the new network interface.
+        webSocket.close();
+        server.stop();
+        server.begin();
+        webSocket.begin();
+        webSocket.onEvent(webSocketEvent);
+        // Advance timestamps so the 20-min idle backstop doesn't immediately trigger.
+        unsigned long now = millis();
+        lastWebRequestMs     = now;
+        lastWebSocketEventMs = now;
+        logHealthEvent("WIFI", "reconnect detected; TCP services restarted");
     }
+    prevWifiUp = wifiUp;
 
+    if (!wifiUp || isRecording) return;
+
+    // --- 20-min idle backstop ---
+    static constexpr unsigned long IDLE_THRESHOLD_MS = 20UL * 60UL * 1000UL;
+    static unsigned long lastTriggerMs = 0;
     unsigned long now = millis();
     unsigned long lastActivity = max(lastWebRequestMs, lastWebSocketEventMs);
     unsigned long idleMs = (lastActivity == 0) ? now : (now - lastActivity);
 
-    if (idleMs >= IDLE_THRESHOLD_MS) {
-        logHealthEvent("WIFI", String("watchdog: ") + String(idleMs / 60000) + "min idle; reconnecting");
-        server.stop();
-        WiFi.reconnect();
-        reconnectPending  = true;
-        reconnectStartMs  = now;
-        // Advance timestamps to prevent immediate re-trigger after reconnect completes
-        lastWebRequestMs     = now;
+    if (idleMs >= IDLE_THRESHOLD_MS &&
+        (lastTriggerMs == 0 || now - lastTriggerMs > IDLE_THRESHOLD_MS)) {
+        logHealthEvent("WIFI", String("watchdog: ") + String(idleMs / 60000) + "min idle; forcing reconnect");
+        lastTriggerMs        = now;
+        lastWebRequestMs     = now;  // prevent re-trigger while reconnect is in flight
         lastWebSocketEventMs = now;
+        WiFi.reconnect();            // triggers disconnect→reconnect; detection block handles service restart
     }
 }
 
