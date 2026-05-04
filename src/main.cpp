@@ -161,15 +161,15 @@ enum PacketType : uint8_t {
     CMD_FLED_PULSE      = 0x1F
 };
 
-struct WifiConfig {
+struct __attribute__((packed)) WifiConfig {
     char ssid[32];
     char password[64];
     char apiBaseUrl[64];
     uint8_t deviceRole;
-    char relayUrl[64];
-    char deviceSecret[64];
+    char relayUrl[48];
+    char deviceSecret[40];
     int32_t cameraId;
-};
+}; // total: 253 bytes — fits in uint8_t UART length field
 
 struct NodeStatus {
     uint8_t ip[4];
