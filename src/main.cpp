@@ -120,8 +120,21 @@ struct MicPinCandidate {
 };
 
 HardwareSerial UART(1);
-WebSocketsServer webSocket = WebSocketsServer(81); 
-WebServer server(80); 
+WebSocketsServer webSocket = WebSocketsServer(81);
+WebServer server(80);
+
+// ── Cloud relay (audio channel) ───────────────────────────────────────────────
+#include "WebSocketsClient.h"
+WebSocketsClient relayAudioWs;
+static bool relayAudioConnected = false;
+static char g_relayUrl[64]      = "";
+static char g_deviceSecret[64]  = "";
+static int32_t g_cameraId       = 0;
+
+void relayAudioEvent(WStype_t type, uint8_t* payload, size_t length) {
+    if (type == WStype_CONNECTED)    { relayAudioConnected = true;  Serial.println("[Relay] audio connected"); }
+    else if (type == WStype_DISCONNECTED) { relayAudioConnected = false; Serial.println("[Relay] audio disconnected"); }
+}
 
 #define START_BYTE 0xAA
 
@@ -153,6 +166,9 @@ struct WifiConfig {
     char password[64];
     char apiBaseUrl[64];
     uint8_t deviceRole;
+    char relayUrl[64];
+    char deviceSecret[64];
+    int32_t cameraId;
 };
 
 struct NodeStatus {
@@ -452,11 +468,14 @@ static void broadcastPendingScopeFrame() {
     }
     taskEXIT_CRITICAL(&scopeFrameMux);
 
-    if (localBytes == 0 || webSocket.connectedClients() == 0) {
-        return;
-    }
+    if (localBytes == 0) return;
 
-    webSocket.broadcastBIN((uint8_t*)localFrame, localBytes);
+    if (webSocket.connectedClients() > 0) {
+        webSocket.broadcastBIN((uint8_t*)localFrame, localBytes);
+    }
+    if (relayAudioConnected) {
+        relayAudioWs.sendBIN((uint8_t*)localFrame, localBytes);
+    }
 }
 
 static void logHealthEvent(const char* topic, const String& message) {
@@ -2039,10 +2058,23 @@ void handlePacket(PacketType type, uint8_t *buffer, uint8_t len) {
           Serial.printf("SSID: %s\n", cfg.ssid);
           Serial.printf("Password: %s\n", cfg.password);
 
+          // Save relay credentials
+          strncpy(g_relayUrl,      cfg.relayUrl,      sizeof(g_relayUrl) - 1);
+          strncpy(g_deviceSecret,  cfg.deviceSecret,  sizeof(g_deviceSecret) - 1);
+          g_cameraId = cfg.cameraId;
+
           bool connected = connectWifiAndStartServices(cfg.ssid, cfg.password, "UART CONFIG_DATA");
           if (!connected) {
               Serial.println("WiFi connect timeout. Waiting for next config handshake...");
               helloSent = false;
+          } else if (g_relayUrl[0] != '\0' && g_cameraId > 0 && g_deviceSecret[0] != '\0') {
+              char path[160];
+              snprintf(path, sizeof(path),
+                  "/?camera_id=%d&secret=%s&channel=audio&role=publish",
+                  (int)g_cameraId, g_deviceSecret);
+              relayAudioWs.onEvent(relayAudioEvent);
+              relayAudioWs.beginSSL(g_relayUrl, 443, path, "", "arduino");
+              Serial.printf("[Relay] Connecting audio to %s%s\n", g_relayUrl, path);
           }
 
           NodeStatus st;
@@ -2169,6 +2201,8 @@ void loop() {
     }
 
     logHealthHeartbeatIfDue();
+
+    relayAudioWs.loop();
 
     if (!isRecording) {
         webSocket.loop();
