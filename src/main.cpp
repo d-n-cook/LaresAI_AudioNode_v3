@@ -8,6 +8,8 @@
 #include <WebServer.h>
 #include "WebSocketsServer.h"
 #include "ElegantOTA.h"
+#include "version.h"
+#include "LaresOTA.h"
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "../lib/MCP23017/src/MCP23017.h"
 #include "globals.h"
@@ -21,7 +23,7 @@
 const int BUZZER  = 4; 
 
 #define SAMPLE_RATE 16000
-#define FRAME_SAMPLES 64
+#define FRAME_SAMPLES 512
 #define WIDTH 60
 
 #define EI_INFERENCE_MIN_CONFIDENCE 0.60f
@@ -130,6 +132,7 @@ static bool relayAudioConnected = false;
 static char g_relayUrl[64]      = "";
 static char g_deviceSecret[64]  = "";
 static int32_t g_cameraId       = 0;
+static char g_apiBaseUrl[64]    = "";
 
 void relayAudioEvent(WStype_t type, uint8_t* payload, size_t length) {
     if (type == WStype_CONNECTED)    { relayAudioConnected = true;  Serial.println("[Relay] audio connected"); }
@@ -192,7 +195,7 @@ static constexpr unsigned long HEALTH_AUDIO_STALL_THRESHOLD_MS = 10000;
 static constexpr uint8_t HEALTH_AUDIO_STALL_CYCLES = 3;
 
 // Recording reliability is the top priority for now.
-static constexpr bool ENABLE_EDGE_IMPULSE_CLASSIFIER = true;
+static constexpr bool ENABLE_EDGE_IMPULSE_CLASSIFIER = false;
 static constexpr bool ENABLE_MIC_PIN_DIAGNOSTIC = true;
 static constexpr bool INCLUDE_PREROLL_IN_RECORDING = true;
 
@@ -1576,7 +1579,7 @@ void setup() {
     .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 4,
-    .dma_buf_len = 256,
+    .dma_buf_len = 512,
     .use_apll = false,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
@@ -1802,12 +1805,7 @@ static void audioCaptureTask(void* parameter) {
 
         // Keep oscilloscope streaming active during idle operation, but mute while recording.
         if (!isRecording) {
-            int16_t scopeFrame[FRAME_SAMPLES] = {0};
-            for (size_t i = 0; i < validSamples; i++) {
-                int32_t scaled = (int32_t)frame[i] * 8;
-                scopeFrame[i] = (int16_t)constrain(scaled, -32768, 32767);
-            }
-            queueScopeFrame(scopeFrame, sizeof(scopeFrame));
+            queueScopeFrame(frame, validSamples * sizeof(int16_t));
         }
 
         int32_t center = (minVal + maxVal) / 2;
@@ -2058,16 +2056,21 @@ void handlePacket(PacketType type, uint8_t *buffer, uint8_t len) {
           Serial.printf("SSID: %s\n", cfg.ssid);
           Serial.printf("Password: %s\n", cfg.password);
 
-          // Save relay credentials
-          strncpy(g_relayUrl,      cfg.relayUrl,      sizeof(g_relayUrl) - 1);
-          strncpy(g_deviceSecret,  cfg.deviceSecret,  sizeof(g_deviceSecret) - 1);
+          // Save relay credentials and API base URL
+          strncpy(g_relayUrl,     cfg.relayUrl,     sizeof(g_relayUrl) - 1);
+          strncpy(g_deviceSecret, cfg.deviceSecret, sizeof(g_deviceSecret) - 1);
+          strncpy(g_apiBaseUrl,   cfg.apiBaseUrl,   sizeof(g_apiBaseUrl) - 1);
           g_cameraId = cfg.cameraId;
 
           bool connected = connectWifiAndStartServices(cfg.ssid, cfg.password, "UART CONFIG_DATA");
           if (!connected) {
               Serial.println("WiFi connect timeout. Waiting for next config handshake...");
               helloSent = false;
-          } else if (g_relayUrl[0] != '\0' && g_cameraId > 0 && g_deviceSecret[0] != '\0') {
+          } else {
+              // OTA check at startup — runs once after WiFi is first confirmed
+              checkForOTAUpdate(FIRMWARE_DEVICE_TYPE, FIRMWARE_VERSION);
+          }
+          if (connected && g_relayUrl[0] != '\0' && g_cameraId > 0 && g_deviceSecret[0] != '\0') {
               char path[160];
               snprintf(path, sizeof(path),
                   "/?camera_id=%d&secret=%s&channel=audio&role=publish",
@@ -2201,6 +2204,13 @@ void loop() {
     }
 
     logHealthHeartbeatIfDue();
+
+    // OTA check every 24 hours (startup check handles boot)
+    static unsigned long lastOtaCheckMs = 86400000UL;
+    if (wifiConfigured && millis() - lastOtaCheckMs >= 86400000UL) {
+        lastOtaCheckMs = millis();
+        checkForOTAUpdate(FIRMWARE_DEVICE_TYPE, FIRMWARE_VERSION);
+    }
 
     relayAudioWs.loop();
 
